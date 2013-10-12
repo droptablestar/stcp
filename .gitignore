@@ -1,5 +1,26 @@
+<<<<<<< HEAD
 *o
 *txt
 client
 server
 rcvd
+=======
+# Object files
+*.o
+*.ko
+
+# Libraries
+*.lib
+*.a
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+>>>>>>> 40a337a20b2765556e361412a529c48fc8c8b49a
