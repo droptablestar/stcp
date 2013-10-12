@@ -1,0 +1,7 @@
+10/12/13:
+Current version is working with unreliable mode on a file size up to 500k.
+ - These is no receiver side buffering at this time.
+ - Retransmission only occurs one packet at a time (as opposed to in bulk).
+ - ACK only happens when reeiver gets the packet its expecting and not a chunk
+   of data.
+   
