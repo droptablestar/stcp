@@ -1,4 +1,4 @@
-import sys
+import sys, random
 
 def main():
     written = 0
@@ -7,7 +7,7 @@ def main():
         if (written+1) % 70 == 0:
             f.write('\n')
         else:
-            f.write('a')
+            f.write(chr(random.randint(65,122)))
         written += 1
 
 if __name__ == '__main__':
