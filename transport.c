@@ -30,17 +30,16 @@ typedef struct {
     tcp_seq initial_sequence_num;
 
     /* any other connection-wide global variables go here */
-    tcp_seq th_local, th_remote, send_base, th_recvtop;
-    
-    char *window;
-    uint32_t *unacked;
+    tcp_seq th_local, th_remote, send_base;
 } context_t;
 
 /********************** MY GLOBAL ADDITIONS **************************/
-tcp_seq st;
+int length=-1;
+double transmitted=0.0, current=0.0;
+bool_t isctrl = true, isactive;
 const short PACKET_SIZE = 536;
 const short HEADER_SIZE = 20;
-const short TOUT = 1500;
+const short TOUT = 500;
 uint16_t WINDOW_SIZE;
 
 typedef struct packet_t {
@@ -59,10 +58,6 @@ typedef struct wqueue {
     uint32_t front, back, size, max;
     packet_t *buffer;
 } Queue;
-
-char *rbuf;
-short *sizes;
-int bytes=0;
 
 static void generate_initial_seq_num(context_t *ctx);
 static void control_loop(mysocket_t sd, context_t *ctx);
@@ -85,6 +80,8 @@ void insert(ooorder *, tcphdr *, const char *);
 void remove(ooorder *r_buf, tcp_seq);
 void print_ooorder(ooorder *);
 int topinorder(mysocket_t, ooorder *, tcp_seq);
+void get_fsize(char *line);
+void print_progress(double);
 
 /********************************************************************/
 
@@ -103,7 +100,6 @@ void transport_init(mysocket_t sd, bool_t is_active) {
     ctx->th_local = ctx->initial_sequence_num;
     ctx->send_base = ctx->initial_sequence_num;
     
-    /* printf("initial sequence number: %u\n", ctx->initial_sequence_num); */
     ctx->l_fin = false, ctx->r_fin = false;
     /* XXX: you should send a SYN packet here if is_active, or wait for one
      * to arrive if !is_active.  after the handshake completes, unblock the
@@ -115,21 +111,25 @@ void transport_init(mysocket_t sd, bool_t is_active) {
     tcphdr *hdr;
     hdr = (tcphdr *) calloc(1, sizeof(tcphdr));
     if (is_active) {
-        /* ctx->th_local = 79; */
-        /* ctx->th_remote = 175; */
+        isactive = true;
+        
+        // sender always has this size (as per instructiosn)
         WINDOW_SIZE = 3072;
 
         // Phase 1: send SYN and seqx
         hdr->th_flags = TH_SYN;
         hdr->th_seq = ctx->th_local;
         hdr->th_win = WINDOW_SIZE;
-
+        stcp_network_send(sd, hdr, sizeof(tcphdr), NULL);
+        
         // Phase 2: Receive SYN_ACK and seqy
         stcp_network_recv(sd, (void *)hdr, sizeof(tcphdr));
         ctx->th_remote = hdr->th_seq;
         
         // check for Phase 2 issues
-        if (hdr->th_flags != (TH_SYN | TH_ACK) || ctx->th_local+1 != hdr->th_ack) {
+        if (hdr->th_flags != (TH_SYN | TH_ACK) ||
+            ctx->th_local+1 != hdr->th_ack) {
+
             hdr->th_flags = TH_FIN;
             stcp_network_send(sd, (void *)hdr, sizeof(tcphdr), NULL);
 
@@ -141,9 +141,9 @@ void transport_init(mysocket_t sd, bool_t is_active) {
         stcp_network_send(sd, (void *)hdr, sizeof(tcphdr), NULL);
     }
     else {
-        /* ctx->th_remote = 79; */
-        /* ctx->th_local = 175; */
-        // Phase 1: Receive SYN and seqx
+        isactive = false;
+        
+        /* Phase 1: Receive SYN and seqx */
         stcp_network_recv(sd, (void *)hdr, sizeof(tcphdr));
         ctx->th_remote = hdr->th_seq;
         WINDOW_SIZE = hdr->th_win;
@@ -168,18 +168,12 @@ void transport_init(mysocket_t sd, bool_t is_active) {
             errno = ECONNREFUSED; perror("handshake"); return;
         }
     }
-    rbuf = (char *) calloc(1, WINDOW_SIZE);
-    sizes = (short *) calloc(WINDOW_SIZE, sizeof(short));
-    
+
+    // modify the initial set up a bit and initialize some more variables
     ctx->th_local++;
     ctx->th_remote++;
-    ctx->th_recvtop = ctx->initial_sequence_num;
-    ctx->th_recvtop = ctx->th_local;
     ctx->send_base = ctx->th_local;
 
-    ctx->window = (char *)calloc(1, WINDOW_SIZE);
-    ctx->unacked = (uint32_t *)calloc(WINDOW_SIZE, sizeof(uint32_t));
-    
     ctx->connection_state = CSTATE_ESTABLISHED;
     stcp_unblock_application(sd);
 
@@ -216,162 +210,197 @@ static void generate_initial_seq_num(context_t *ctx) {
 static void control_loop(mysocket_t sd, context_t *ctx) {
     assert(ctx);
 
+    // use this header when parsing the incoming TCP header, or for
+    // constructing an
+    // outgoing SEGMENT
     tcphdr *hdr;
     hdr = (tcphdr *) calloc(1, sizeof(tcphdr));
 
+    // this is the queue of outgoing segments from the sender
     wqueue s_queue;
-    ooorder r_buf;
     make_queue(&s_queue, ctx);
+
+    // a linked list of out of order segments received by receiver
+    ooorder r_buf;
     init_ooorder(&r_buf);
-    st = ctx->th_remote;
+
+    // timeout for event
     timespec to;
     while (!ctx->done)
     {
         unsigned int event = 0;
-        
-        /* see stcp_api.h or stcp_api.c for details of this function */
 
-        /* XXX: you will need to change some of these arguments! */
+        // set up timeout values and call wait_for_event()
         to.tv_sec = time(NULL) + 2;
         to.tv_nsec = 0;
         event = stcp_wait_for_event(sd, APP_DATA | NETWORK_DATA, &to);
 
-        /* if (!event) event |= APP_CLOSE_REQUESTED; */
+        // received data from network layer
         if (event & NETWORK_DATA) {
-            printf("*********NETWORK RECEIVE************\n");
+            // read the segment into this buffer (SHOULDNT be larger than
+            // PACKET_SIZE)
             char buf[PACKET_SIZE] = {0};
+            // payload from segment
             char data[PACKET_SIZE - HEADER_SIZE] = {0};
             stcp_network_recv(sd, buf, PACKET_SIZE);
 
+            // copy into appropriate locations
             memcpy(hdr, buf, HEADER_SIZE);
             memcpy(data, &(buf[HEADER_SIZE]), PACKET_SIZE - HEADER_SIZE);
             
-            printf("expected: %d received: %d\n", ctx->th_remote, hdr->th_seq);
-            ctx->th_recvtop = ctx->th_remote+strlen(data) + 1;
+            /* printf("expected: %d received: %d\n", */
+            /*    ctx->th_remote, hdr->th_seq); */
 
-            // ACK received
+            /* ACK received */
             if (hdr->th_flags == TH_ACK) {
-                printf("*********ACK receieved***********\n");
+                /* printf("*********ACK receieved***********\n"); */
+                /* printf("local: %d remote: %d base: %d ack: %d seq: %d\n", */
+                /*        ctx->th_local, ctx->th_remote, ctx->send_base, */
+                /*        hdr->th_ack, hdr->th_seq); */
 
-                printf("local: %d remote: %d base: %d ack: %d seq: %d\n",
-                       ctx->th_local, ctx->th_remote, ctx->send_base,
-                       hdr->th_ack, hdr->th_seq);
-                if (ctx->l_fin && ctx->r_fin) {
-                    ctx->done = true; continue;
+                if (ctx->l_fin && ctx->r_fin) {  // last ACK from 4 way term
+                    ctx->done = true;
+                    continue;
                 }
-                
+
+                // received an ack larger than the sendbase, receiver is ahead
                 if (ctx->send_base < hdr->th_ack) {
                     ctx->send_base = hdr->th_ack;
+                    // remove everything up to this ACK from sender buffer and
+                    // retransmit
                     cumulative_ack(&s_queue, hdr->th_ack);
                     retransmit_ack(sd, &s_queue, hdr->th_ack);
-                    print_queue(&s_queue);
                 }
             }
-            // send ACK
+            // data received inside window, send ACK, buffer if out of order
             else if (hdr->th_seq < (ctx->th_remote+WINDOW_SIZE-1)) {
+                if (isctrl && isactive) {
+                    isctrl = false;
+                    char *copy = strdup(data);
+                    get_fsize(copy);
+                    free(copy);
+                    if (length == -1) {
+                        mysock_context_t *ctx_s = _mysock_get_context(sd);
+                        ctx_s->close_requested = true;
+                        continue;
+                    }
+                    else 
+                        transmitted -= strlen(data);
+
+                }
+                    
+                // insert this segment into out of order buffer
                 if (hdr->th_seq >= ctx->th_remote)
                     insert(&r_buf, hdr, data);
-                /* print_ooorder(&r_buf); */
-                // try to queue this packet
+                /* printf("SEGMENT RCVD: seq: %d remote: %d size: %lu\n", */
+                /*        hdr->th_seq, ctx->th_remote, strlen(data)); */
+                
+                // received FIN
                 if (hdr->th_flags == TH_FIN) {
-                    printf("FIN!!!!\n");
+                    /* printf("FIN\n"); */
                     if (!ctx->l_fin) {
                         mysock_context_t *ctx_s = _mysock_get_context(sd);
                         ctx_s->close_requested = true;
                     }
                     ctx->r_fin = true;
                 }
-
                 // correct next packet
-                printf("SEGMENT RECEIVED: seq: %d remote: %d size: %lu top: %d\n",
-                       hdr->th_seq, ctx->th_remote, strlen(data), ctx->th_recvtop);
-                ctx->th_recvtop += strlen(data);
-                hdr->th_flags = TH_ACK;
-                if (ctx->th_remote == hdr->th_seq) {
-                    bytes += strlen(data);
+                else if (ctx->th_remote == hdr->th_seq) {
+                    hdr->th_flags = TH_ACK;
+                    // send data to app
+                    transmitted += strlen(data);
+                    print_progress(transmitted);
+
                     stcp_app_send(sd, data, strlen(data));
-                    printf("^^^^^^^BYTES SENT: %d^^^^^^^\n", bytes);
-                    int newack = topinorder(sd, &r_buf, hdr->th_seq+strlen(data)) + 1;
-                    newack = newack == -1 ? hdr->th_seq+strlen(data)+1 : newack;
-                    printf("-----TOP: %d-----\n", newack);
+                    // obtain the proper ACK (if there are more packets that
+                    // were received out of order
+                    int newack = topinorder(sd, &r_buf,
+                                            hdr->th_seq+strlen(data)) + 1;
+                    newack = newack == -1 ?
+                        hdr->th_seq+strlen(data)+1 : newack;
+
 
                     ctx->th_remote = newack;
                     hdr->th_ack = ctx->th_remote;
-                    ctx->th_recvtop = ctx->th_remote;
                     stcp_network_send(sd, hdr, HEADER_SIZE, NULL);
-                    printf("*********ACK SENT: seq: %d ack: %d************\n",
-                           hdr->th_seq, hdr->th_ack);
+                    // check to see if both parties are finished
                     if (ctx->l_fin && ctx->r_fin) ctx->done = true;
                 }
+                // if this segment has already been ACK'd send another
+
                 else if (hdr->th_seq < ctx->th_remote) {
+                    hdr->th_flags = TH_ACK;
                     hdr->th_ack = ctx->th_remote;
                     stcp_network_send(sd, hdr, HEADER_SIZE, NULL);
-                    printf("*********ACK SENT: seq: %d ack: %d************\n",
-                           hdr->th_seq, hdr->th_ack);
                 }
+                /* printf("*********ACK SENT: seq: %d ack: %d***********\n", */
+                /*        hdr->th_seq, hdr->th_ack); */
             }
             clear_hdr(hdr);
         } // if (NETWORK_DATA)
 
-        /* check whether it was the network, app, or a close request */
+        // APP sending data
         if (event & APP_DATA) {
             /* the application has requested that data be sent */
             if (ctx->th_local < ctx->send_base + WINDOW_SIZE) {
-                printf("*********APP SEND************\n");
-                /* printf("next: %d base: %d\n", ctx->th_local, ctx->send_base); */
+                // get data for this packet
                 char data[PACKET_SIZE - HEADER_SIZE] = {0};
                 stcp_app_recv(sd, data, (PACKET_SIZE - HEADER_SIZE-1));
-                /* printf("data: [%s]\n", data); */
-                /* printf("data: [%s] length: %lu\n", data, strlen(data)); */
                  
                 // construct header for this packet
                 hdr->th_seq = ctx->th_local;
                 hdr->th_win = WINDOW_SIZE;
 
-                printf("hdr->seq: %d ctx->local: %d size: %lu\n",
-                       hdr->th_seq,ctx->th_local, strlen(data));
-                stcp_network_send(sd, hdr, HEADER_SIZE, data,
-                                  PACKET_SIZE - HEADER_SIZE, NULL);
-
+                /* printf("*********APP SEND************\n"); */
+                /* printf("hdr->seq: %d ctx->local: %d size: %lu\n", */
+                /*        hdr->th_seq,ctx->th_local, strlen(data)); */
                 
+                stcp_network_send(sd, hdr, HEADER_SIZE, data,
+                                  strlen(data), NULL);
+
+                // place this packet in the sender buffer
                 enqueue(&s_queue, hdr, data);
-                /* print_queue(&s_queue); */
                 ctx->th_local += strlen(data)+1;
-                printf("*********APP SEND************\n");
 
                 clear_hdr(hdr);
             }
         } // if (APP_DATA)
 
+        // APP_CLOSE
         if (event & APP_CLOSE_REQUESTED) {
-            printf("APP CLOSE\n");
+            /* printf("APP CLOSE\n"); */
             hdr->th_flags = TH_FIN; hdr->th_seq = ctx->th_local;
             ctx->l_fin = true;
             char x[] = "";
             enqueue(&s_queue, hdr, x);
             stcp_network_send(sd, hdr, HEADER_SIZE, NULL);
-        }
+        } // if (APP_CLOSE_REQUESTED)
+
+        // check for timeouts, retransmit
         int tout = check_timeout(&s_queue);
         if (tout == -2) ctx->done = true;
         else if (tout != -1)
             retransmit(sd, tout, &s_queue);
+        if (ctx->l_fin && ctx->r_fin) ctx->done = true;
     }
-    printf("DONE!\n\n");
+    printf("\nDONE!\n\n");
     free(hdr);
-    /* free(&s_queue); */
-    /* free(&r_queue); */
-}
+} // control_loop()
 
+// initializes the out of order receiver linked list
 void init_ooorder(ooorder *r_buf) {
     r_buf->head = NULL; r_buf->tail = NULL;
-}
+} // init_ooorder()
 
+// insert a segment into the receiver out of order buffer
 void insert(ooorder *r_buf, tcphdr *hdr, const char *data) {
+    // get size of data and read into header and payload
     ssize_t len = strlen(data)+HEADER_SIZE+1;
     char *packet = (char *) calloc(1, len);
     memcpy(packet, hdr, sizeof(tcphdr));
     memcpy(&packet[HEADER_SIZE], data, len-HEADER_SIZE);
 
+    // construct packet to be stored
     packet_t *pack = (packet_t *) calloc(1, sizeof(packet_t));
     pack->seq = hdr->th_seq;
     pack->payload = (char *) malloc(len);
@@ -379,27 +408,25 @@ void insert(ooorder *r_buf, tcphdr *hdr, const char *data) {
 
     // empty list
     if (r_buf->head == NULL) {
-        printf("INSERTING: %d head: NULL tail: NULL\n", hdr->th_seq);
         pack->next = NULL;
         pack->prev = NULL;
         r_buf->head = pack;
         r_buf->tail = pack;
     }
     else {
-        printf("INSERTING: %d head: %d tail: %d\n",
-               hdr->th_seq, r_buf->head->seq, r_buf->tail->seq);
         pack->next = NULL;
         pack->prev = r_buf->tail;
         pack->prev->next = pack;
         r_buf->tail = pack;
     }
-}
+} // insert()
 
+// remove element from receiver out of order linked list
+// also removes any duplicates
 void remove(ooorder *r_buf, tcp_seq seq) {
     packet_t *start = r_buf->head;
     while (start != NULL) {
         if (start->seq == seq) {
-            /* printf("DELTEING: %d\n", start->seq); */
             if (start->prev == NULL) {
                 r_buf->head = start->next;
                 if (r_buf->head != NULL) r_buf->head->prev = NULL;
@@ -411,34 +438,33 @@ void remove(ooorder *r_buf, tcp_seq seq) {
                 if (r_buf->tail != NULL) r_buf->tail->next = NULL;
             }
             else start->next->prev = start->prev;
-            /* free(start->payload); */
         }
         start = start->next;
     }
-}
+} // remove()
 
+// check for in order packets past the newest receieved
 int topinorder(mysocket_t sd, ooorder *r_buf, tcp_seq seq) {
+    // uhhhh........
     int newack = -2;
     packet_t *start;
     do {
         start = r_buf->head;
         while (start != NULL) {
-            printf("START SEQ: %d seq: %d\n",
-                   start->seq, seq+1);
-            if (start->seq < seq+1) {
+            if (start->seq < seq+1) 
                 remove(r_buf, start->seq);
-                /* if (newack < (int)seq) */
-                /*     newack = start->seq + strlen(&start->payload[HEADER_SIZE]); */
-                /* seq += strlen(&start->payload[HEADER_SIZE]); */
-            }
+
             else if (start->seq == seq+1) {
                 char data[PACKET_SIZE-HEADER_SIZE] = {0};
-                memcpy(data, &start->payload[HEADER_SIZE], PACKET_SIZE-HEADER_SIZE);
-                bytes+=strlen(data);
-                stcp_app_send(sd, data, strlen(data));
-                printf("^^^^^^^BYTES SENT: %d^^^^^^^\n", bytes);
+                memcpy(data, &start->payload[HEADER_SIZE],
+                       PACKET_SIZE-HEADER_SIZE);
 
-                newack = start->seq + strlen(&start->payload[HEADER_SIZE]);
+                transmitted += strlen(data);
+                print_progress(transmitted);
+
+                stcp_app_send(sd, data, strlen(data));
+
+                newack = start->seq+strlen(&start->payload[HEADER_SIZE]);
                 remove(r_buf, seq);
                 seq += strlen(&start->payload[HEADER_SIZE])+1;
             }
@@ -447,8 +473,9 @@ int topinorder(mysocket_t sd, ooorder *r_buf, tcp_seq seq) {
     } while(start != NULL);
 
     return newack;
-}
+} // topinorder()
 
+// print the receiver buffer (DEBUG)
 void print_ooorder(ooorder *r_buf) {
     packet_t *start = r_buf->head;
     while (start != NULL) {
@@ -456,45 +483,44 @@ void print_ooorder(ooorder *r_buf) {
         start = start->next;
     }
 
-}
+} // print_ooorder()
 
+// resets a header to all 0's
 void clear_hdr(tcphdr *hdr) {
     hdr->th_flags = 0;
     hdr->th_ack = 0;
     hdr->th_seq = 0;
     hdr->th_win = 0;
-}
+} // clear_hdr()
 
+// find the first segment to have timed out and returns its index
 int check_timeout(wqueue *queue) {
     uint32_t i = queue->front;
-    /* print_queue(queue); */
     struct timeval now;
     gettimeofday(&now, NULL);
     for (; i<queue->back; i++) {
-        /* printf("CHECKING TIMOUT front: %d back: %d seq: %d now: %lu then: %lu diff: %lu\n", */
-        /*        queue->front, queue->back, queue->buffer[i].seq, */
-        /*        tv2ms(&now), tv2ms(&queue->buffer[i].sent), */
-        /*        tv2ms(&now) - tv2ms(&queue->buffer[i].sent)); */
         if (queue->buffer[i].tries == 6) return -2;
         if ((tv2ms(&now) - tv2ms(&queue->buffer[i].sent)) > (TOUT))
             return i;
     }
     return -1;
-}
+} // check_timeout()
 
+// sets up the sender queue
 void make_queue(wqueue *queue, context_t *ctx) {
     queue->front = ctx->th_local; queue->back = queue->front;
     queue->size = 0; queue->max = WINDOW_SIZE;
     queue->buffer = (packet_t *) calloc(WINDOW_SIZE, sizeof(packet_t));
-}
+} // make_queue()
 
+// frees the memory from the sender queue
 void destroy_queue(wqueue *queue) {
     free(queue->buffer);
-}
+} // destroy_queue()
 
+// constructs and places an element in the sender queue
 int enqueue(wqueue *queue, tcphdr *hdr, char *data) {
     ssize_t len = strlen(data)+HEADER_SIZE+1;
-    /* printf("ENQUEUING: seq: %d \n", hdr->th_seq); */
 
     char *packet = (char *) calloc(1, len);
     memcpy(packet, hdr, sizeof(tcphdr));
@@ -512,8 +538,9 @@ int enqueue(wqueue *queue, tcphdr *hdr, char *data) {
     queue->size += len-HEADER_SIZE;
 
     return len;
-}
+} // enqueue()
 
+// print the sender queue (DEBUG)
 void print_queue(wqueue *queue) {
     printf("QUEUE front: %u size: %u\n", queue->front, queue->size); 
    uint32_t i=queue->front;
@@ -522,11 +549,12 @@ void print_queue(wqueue *queue) {
     for (; i<queue->back; i++) {
         packet_t p = queue->buffer[i];
         printf("______index: %d_______\n", i);
-        printf("TIME LEFT: %lu SEQ: %d TRIES: %d\n", tv2ms(&now)-tv2ms(&p.sent), p.seq, p.tries);
-        /* print_packet(p.payload); */
+        printf("TIME LEFT: %lu SEQ: %d TRIES: %d\n",
+               tv2ms(&now)-tv2ms(&p.sent), p.seq, p.tries);
     }
-}
+} // print_queue()
 
+// removes an elements from the sender queue
 packet_t *dequeue(wqueue *queue) {
     if (queue->size == 0) return NULL;
 
@@ -535,36 +563,35 @@ packet_t *dequeue(wqueue *queue) {
     queue->size -= strlen(&(p->payload[HEADER_SIZE]))+1;
 
     return p;
-}
+} // dequeue()
 
+// removes all elements from the sender's queue up to ack
 void cumulative_ack(wqueue *queue, tcp_seq ack) {
     uint32_t i = queue->front;
-    /* printf("CUMUL_ACK: front: %d back: %d seq: %d ack: %d\n", */
-    /*        queue->front, queue->back, p->seq, ack); */
     for (; i<queue->back; i++) {
         if (queue->buffer[i].seq < ack) dequeue(queue);
         else break;
-        /* printf("**ACKING: %d**\n", p->seq); */
     }        
-}
+} // cumulative_ack()
 
+// retransmits all packets in the senders buffer less than ack
 void retransmit_ack(mysocket_t sd, wqueue *queue, tcp_seq ack) {
     uint i = queue->front;
     for (; i<queue->back; i++)
         if (queue->buffer[i].seq < ack)
             stcp_network_send(sd, queue->buffer[i].payload, PACKET_SIZE, NULL);
-}
+} // retransmit_ack()
 
+// retransmits a segment that timed out. increments their retransmission counts
 void retransmit(mysocket_t sd, int top, wqueue *queue) {
-    printf("RETRANSMITTING: %d seq: %d tries: %d\n",
-           top, queue->buffer[top].seq, queue->buffer[top].tries);
-    timeval now;
-    gettimeofday(&now, NULL);
+    /* printf("RETRANSMITTING: %d seq: %d tries: %d\n", */
+    /*        top, queue->buffer[top].seq, queue->buffer[top].tries); */
     gettimeofday(&(queue->buffer[top].sent), NULL);
     queue->buffer[top].tries += 1;
     stcp_network_send(sd, queue->buffer[top].payload, PACKET_SIZE, NULL);
-}
+} // retransmit()
 
+// prints a packet (DEBUG)
 void print_packet(char *packet) {
     tcp_seq seq, ack;
     uint8_t off, flags;
@@ -577,19 +604,45 @@ void print_packet(char *packet) {
     char data[PACKET_SIZE-HEADER_SIZE];
     memcpy(data, packet+HEADER_SIZE, strlen(packet+HEADER_SIZE)+1);
     
-    seq=hdr->th_seq;ack=hdr->th_ack;off=hdr->th_off;flags=hdr->th_flags;win=hdr->th_win;
+    seq=hdr->th_seq;ack=hdr->th_ack;off=hdr->th_off;
+    flags=hdr->th_flags;win=hdr->th_win;
     printf("*****************PACKET******************\n");
     printf("SEQ: %u ACK: %u OFF: %d FLAGS: %d WIN: %d\n",seq,ack,off,flags,win);
     /* printf("DATA: [%s]", data); */
     printf("\n*****************************************\n");
 
     free(hdr);
-}
+} // print_packet()
 
 /* convert struct timeval to ms(milliseconds) */
 /* FROM: http://enl.usc.edu/enl/trunk/peg/testPlayer/timeval.c */
 unsigned long int tv2ms(struct timeval *a) {
     return ((a->tv_sec * 1000) + (a->tv_usec / 1000));
+} // tv2ms()
+
+void get_fsize(char *line)  {
+    char *resp;
+
+    if (NULL == (resp = strrchr(line, ','))) {
+        fprintf(stderr, "Malformed response from server.\n");
+        length = -1;
+    }
+    *resp++ = '\0';
+
+    if (NULL == (resp = strrchr(line, ','))) {
+        fprintf(stderr, "Malformed response from server.\n");
+        length = -1;
+    }
+    *resp++ = '\0';
+    
+    sscanf(resp, "%d", &length);}
+
+void print_progress(double transmitted) {
+    if ((transmitted - current) >= 2000 || transmitted == length) {
+        current = transmitted;
+        printf("%.0f bytes out of %d bytes -- %.0f%%\n",
+               transmitted, length, transmitted/length*100);
+    }
 }
 
 /**********************************************************************/

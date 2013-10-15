@@ -94,12 +94,13 @@ void _mysock_transport_init(mysocket_t sd, bool_t is_active)
         abort();
     }
 
-    /* start a new transport layer thread */
-    connection_context->transport_thread = _mysock_create_thread(
-        transport_thread_func,
-        connection_context,
-        FALSE);
-    connection_context->transport_thread_started = TRUE;
+/* start a new transport layer thread */
+connection_context->transport_thread = _mysock_create_thread(
+transport_thread_func,
+    connection_context,
+    FALSE);
+connection_context->transport_thread_started = TRUE;
+printf("HERE\n");
 }
 
 int _mysock_wait_for_connection(mysock_context_t *ctx)
@@ -356,7 +357,6 @@ static void *transport_thread_func(void *arg_ptr) {
     /* transport_init() has returned; both sides have closed the connection,
      * do some final cleanup here...
      */
-
     PTHREAD_CALL(pthread_mutex_lock(&ctx->blocking_lock));
     if (ctx->blocking)
     {
