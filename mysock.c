@@ -100,7 +100,6 @@ transport_thread_func,
     connection_context,
     FALSE);
 connection_context->transport_thread_started = TRUE;
-printf("HERE\n");
 }
 
 int _mysock_wait_for_connection(mysock_context_t *ctx)

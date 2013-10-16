@@ -97,7 +97,6 @@ main(int argc, char *argv[]) {
         mysocket_t sd;
 
         /* just keep accepting connections forever */
-        printf("MYACCEPT\n");
         if ((sd = myaccept(bindsd, (struct sockaddr *) &sin, &len)) < 0)
         {
             perror("myaccept");
@@ -110,7 +109,6 @@ main(int argc, char *argv[]) {
                 inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
 
         do_connection(sd);
-        printf("DONE CONNECTION!\n");
     } /* end for(;;) */
     if (myclose(bindsd) < 0)
         perror("myclose (bindsd)");
@@ -147,7 +145,6 @@ static void do_connection(mysocket_t sd) {
 done:
     if (myclose(sd) < 0)
         perror("myclose (sd)");
-    printf("LEAVING\n");
 }
 
 
