@@ -251,17 +251,17 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
 
             // copy into appropriate locations
             memcpy(hdr, buf, HEADER_SIZE);
-            memcpy(data, &(buf[HEADER_SIZE]), PACKET_SIZE - HEADER_SIZE);
-            
-            /* printf("expected: %d received: %d\n", */
-            /*    ctx->th_remote, hdr->th_seq); */
+            memcpy(data, &(buf[HEADER_SIZE]), rcvd);
+
+            printf("expected: %d received: %d LENGTH: %lu\n",
+                   ctx->th_remote, hdr->th_seq, strlen(data));
 
             /* ACK received */
             if (hdr->th_flags == TH_ACK) {
-                /* printf("*********ACK receieved***********\n"); */
-                /* printf("local: %d remote: %d base: %d ack: %d seq: %d\n", */
-                /*        ctx->th_local, ctx->th_remote, ctx->send_base, */
-                /*        hdr->th_ack, hdr->th_seq); */
+                printf("*********ACK receieved***********\n");
+                printf("local: %d remote: %d base: %d ack: %d seq: %d\n",
+                       ctx->th_local, ctx->th_remote, ctx->send_base,
+                       hdr->th_ack, hdr->th_seq);
 
                 if (ctx->l_fin && ctx->r_fin) {  // last ACK from 4 way term
                     ctx->done = true;
@@ -298,12 +298,11 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                 if (hdr->th_seq >= ctx->th_remote) 
                     insert(&r_buf, hdr, data, rcvd);
 
-                /* printf("SEGMENT RCVD: seq: %d remote: %d size: %lu\n", */
-                /*        hdr->th_seq, ctx->th_remote, rcvd); */
+                printf("SEG RCVD: seq: %d remote: %d size: %lu data: %lu\n",
+                       hdr->th_seq, ctx->th_remote, rcvd, strlen(data));
                 
                 // received FIN
                 if (hdr->th_flags == TH_FIN) {
-                    /* printf("FIN\n"); */
                     if (!ctx->l_fin) {
                         mysock_context_t *ctx_s = _mysock_get_context(sd);
                         ctx_s->close_requested = true;
@@ -317,16 +316,12 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                     transmitted += rcvd;
                     print_progress(transmitted);
 
-                    /* stcp_app_send(sd, data, strlen(data)); */
+                    printf("*$*$*$*$SENDING: %lu*$*$**$$\n", rcvd);
                     stcp_app_send(sd, data, rcvd);
                     // obtain the proper ACK (if there are more packets that
                     // were received out of order
-                    /* int newack = topinorder(sd, &r_buf, */
-                    /*                         hdr->th_seq+strlen(data)) + 1; */
-                    /* newack = newack == -1 ? */
-                    /*     hdr->th_seq+strlen(data)+1 : newack; */
                     int newack = topinorder(sd, &r_buf,
-                                            hdr->th_seq+rcvd-1);
+                                            hdr->th_seq+rcvd);
                     newack = newack == -2 ?
                         hdr->th_seq+rcvd : newack;
 
@@ -345,8 +340,8 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                     hdr->th_ack = ctx->th_remote;
                     stcp_network_send(sd, hdr, HEADER_SIZE, NULL);
                 }
-                /* printf("*********ACK SENT: seq: %d ack: %d***********\n", */
-                /*        hdr->th_seq, hdr->th_ack); */
+                printf("*********ACK SENT: seq: %d ack: %d***********\n",
+                       hdr->th_seq, hdr->th_ack);
             }
             clear_hdr(hdr);
         } // if (NETWORK_DATA)
@@ -364,17 +359,15 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                 hdr->th_seq = ctx->th_local;
                 hdr->th_win = WINDOW_SIZE;
 
-                /* printf("*********APP SEND************\n"); */
-                /* size_t sent = stcp_network_send(sd,hdr,HEADER_SIZE,data, */
-                /*                                 strlen(data), NULL); */
+                printf("*********APP SEND************\n");
+                printf("hdr->seq: %d ctx->local: %d size: %lu\n",
+                       hdr->th_seq,ctx->th_local, len);
+
                 size_t sent = stcp_network_send(sd, hdr, HEADER_SIZE, data,
                                                 len, NULL)-HEADER_SIZE;
-
-                /* printf("hdr->seq: %d ctx->local: %d size: %lu\n", */
-                /*        hdr->th_seq,ctx->th_local, sent); */
-                // place this packet in the sender buffer
+                
+                printf("SENDING: %lu\n", sent);
                 enqueue(&s_queue, hdr, data, sent);
-                /* ctx->th_local += strlen(data)+1; */
                 ctx->th_local += sent;
 
                 clear_hdr(hdr);
@@ -383,7 +376,6 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
 
         // APP_CLOSE
         if (event & APP_CLOSE_REQUESTED) {
-            /* printf("APP CLOSE\n"); */
             hdr->th_flags = TH_FIN; hdr->th_seq = ctx->th_local;
             ctx->l_fin = true;
             char x[] = "";
@@ -410,21 +402,18 @@ void init_ooorder(ooorder *r_buf) {
 // insert a segment into the receiver out of order buffer
 void insert(ooorder *r_buf, tcphdr *hdr, const char *data, size_t len) {
     // get size of data and read into header and payload
-    /* ssize_t len = strlen(data)+HEADER_SIZE+1; */
-    /* char *packet = (char *) calloc(1, len); */
-    char *packet = (char *) calloc(1, PACKET_SIZE);
-    memcpy(packet, hdr, sizeof(tcphdr));
-    /* memcpy(&packet[HEADER_SIZE], data, len-HEADER_SIZE); */
-    memcpy(&packet[HEADER_SIZE], data, PACKET_SIZE-HEADER_SIZE);
+    /* char *packet = (char *) calloc(1, PACKET_SIZE); */
+    /* memcpy(packet, hdr, sizeof(tcphdr)); */
+    /* memcpy(&packet[HEADER_SIZE], data, PACKET_SIZE-HEADER_SIZE); */
 
     // construct packet to be stored
     packet_t *pack = (packet_t *) calloc(1, sizeof(packet_t));
     pack->seq = hdr->th_seq;
     pack->len = len;
-    /* pack->payload = (char *) malloc(len); */
-    /* memcpy(pack->payload, packet, len); */
-    pack->payload = (char *) malloc(PACKET_SIZE-HEADER_SIZE);
-    memcpy(pack->payload, packet, PACKET_SIZE-HEADER_SIZE);
+    pack->payload = (char *) malloc(len);
+    printf("INSERTING %d length: %lu copied: %lu\n",
+           pack->seq, strlen(data), len);
+    memcpy(pack->payload, data, len);
     
     // empty list
     if (r_buf->head == NULL) {
@@ -471,18 +460,18 @@ int topinorder(mysocket_t sd, ooorder *r_buf, tcp_seq seq) {
     do {
         start = r_buf->head;
         while (start != NULL) {
-            /* printf("START SEQ: %d seq: %d\n",start->seq, seq); */
+            printf("START: %d SEQ: %d\n", start->seq, seq);
             if (start->seq < seq) 
                 remove(r_buf, start->seq);
 
             else if (start->seq == seq) {
                 char data[PACKET_SIZE-HEADER_SIZE] = {0};
-                memcpy(data, &start->payload[HEADER_SIZE],
-                       PACKET_SIZE-HEADER_SIZE);
+                memcpy(data, start->payload, start->len);
 
                 transmitted += start->len;
                 print_progress(transmitted);
 
+                printf("***SENDING: %lu\n", start->len);
                 stcp_app_send(sd, data, start->len);
 
                 newack = start->seq + start->len;
@@ -495,6 +484,25 @@ int topinorder(mysocket_t sd, ooorder *r_buf, tcp_seq seq) {
 
     return newack;
 } // topinorder()
+
+// retransmits a segment that timed out. increments their retransmission counts
+void retransmit(mysocket_t sd, int top, wqueue *queue) {
+    printf("RETRANSMITTING: %d seq: %d tries: %d length: %lu send: %lu\n",
+           top, queue->buffer[top].seq, queue->buffer[top].tries,
+           queue->buffer[top].len, HEADER_SIZE+queue->buffer[top].len);
+    gettimeofday(&(queue->buffer[top].sent), NULL);
+    queue->buffer[top].tries += 1;
+    stcp_network_send(sd, queue->buffer[top].payload,
+                      HEADER_SIZE+queue->buffer[top].len, NULL);
+} // retransmit()
+
+// retransmits all packets in the senders buffer less than ack
+void retransmit_ack(mysocket_t sd, wqueue *queue, tcp_seq ack) {
+    uint i = queue->front;
+    for (; i<queue->back; i++)
+        if (queue->buffer[i].seq < ack)
+            stcp_network_send(sd, queue->buffer[i].payload, PACKET_SIZE, NULL);
+} // retransmit_ack()
 
 // print the receiver buffer (DEBUG)
 void print_ooorder(ooorder *r_buf) {
@@ -541,7 +549,6 @@ void destroy_queue(wqueue *queue) {
 
 // constructs and places an element in the sender queue
 int enqueue(wqueue *queue, tcphdr *hdr, char *data, size_t length) {
-    /* ssize_t len = strlen(data)+HEADER_SIZE+1; */
     ssize_t len = length+HEADER_SIZE;
 
     char *packet = (char *) calloc(1, len);
@@ -563,27 +570,13 @@ int enqueue(wqueue *queue, tcphdr *hdr, char *data, size_t length) {
     return len;
 } // enqueue()
 
-// print the sender queue (DEBUG)
-void print_queue(wqueue *queue) {
-    printf("QUEUE front: %u size: %u\n", queue->front, queue->size); 
-   uint32_t i=queue->front;
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    for (; i<queue->back; i++) {
-        packet_t p = queue->buffer[i];
-        printf("______index: %d_______\n", i);
-        printf("TIME LEFT: %lu SEQ: %d TRIES: %d\n",
-               tv2ms(&now)-tv2ms(&p.sent), p.seq, p.tries);
-    }
-} // print_queue()
-
 // removes an elements from the sender queue
 packet_t *dequeue(wqueue *queue) {
     if (queue->size == 0) return NULL;
 
     packet_t *p = &(queue->buffer[queue->front]);
     queue->front = (queue->front+1) % queue->max;
-    queue->size -= strlen(&(p->payload[HEADER_SIZE]))+1;
+    queue->size -= p->len;
 
     return p;
 } // dequeue()
@@ -597,24 +590,20 @@ void cumulative_ack(wqueue *queue, tcp_seq ack) {
     }        
 } // cumulative_ack()
 
-// retransmits all packets in the senders buffer less than ack
-void retransmit_ack(mysocket_t sd, wqueue *queue, tcp_seq ack) {
-    uint i = queue->front;
-    for (; i<queue->back; i++)
-        if (queue->buffer[i].seq < ack)
-            stcp_network_send(sd, queue->buffer[i].payload, PACKET_SIZE, NULL);
-} // retransmit_ack()
 
-// retransmits a segment that timed out. increments their retransmission counts
-void retransmit(mysocket_t sd, int top, wqueue *queue) {
-    /* printf("RETRANSMITTING: %d seq: %d tries: %d length: %lu\n", */
-    /*        top, queue->buffer[top].seq, queue->buffer[top].tries, */
-    /*        queue->buffer[top].len); */
-    gettimeofday(&(queue->buffer[top].sent), NULL);
-    queue->buffer[top].tries += 1;
-    stcp_network_send(sd, queue->buffer[top].payload,
-                      HEADER_SIZE+queue->buffer[top].len, NULL);
-} // retransmit()
+// print the sender queue (DEBUG)
+void print_queue(wqueue *queue) {
+    printf("QUEUE front: %u size: %u\n", queue->front, queue->size); 
+   uint32_t i=queue->front;
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    for (; i<queue->back; i++) {
+        packet_t p = queue->buffer[i];
+        printf("______index: %d_______\n", i);
+        printf("TIME LEFT: %lu SEQ: %d TRIES: %d\n",
+               tv2ms(&now)-tv2ms(&p.sent), p.seq, p.tries);
+    }
+} // print_queue()
 
 // prints a packet (DEBUG)
 void print_packet(char *packet) {
