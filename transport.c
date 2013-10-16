@@ -242,21 +242,22 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
             char buf[PACKET_SIZE] = {0};
             // payload from segment
             char data[PACKET_SIZE - HEADER_SIZE] = {0};
-            stcp_network_recv(sd, buf, PACKET_SIZE);
+            size_t rcvd = stcp_network_recv(sd, buf, PACKET_SIZE);
+            printf("received: %lu\n", rcvd);
 
             // copy into appropriate locations
             memcpy(hdr, buf, HEADER_SIZE);
             memcpy(data, &(buf[HEADER_SIZE]), PACKET_SIZE - HEADER_SIZE);
             
-            /* printf("expected: %d received: %d\n", */
-            /*    ctx->th_remote, hdr->th_seq); */
+            printf("expected: %d received: %d\n",
+               ctx->th_remote, hdr->th_seq);
 
             /* ACK received */
             if (hdr->th_flags == TH_ACK) {
-                /* printf("*********ACK receieved***********\n"); */
-                /* printf("local: %d remote: %d base: %d ack: %d seq: %d\n", */
-                /*        ctx->th_local, ctx->th_remote, ctx->send_base, */
-                /*        hdr->th_ack, hdr->th_seq); */
+                printf("*********ACK receieved***********\n");
+                printf("local: %d remote: %d base: %d ack: %d seq: %d\n",
+                       ctx->th_local, ctx->th_remote, ctx->send_base,
+                       hdr->th_ack, hdr->th_seq);
 
                 if (ctx->l_fin && ctx->r_fin) {  // last ACK from 4 way term
                     ctx->done = true;
@@ -292,13 +293,14 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                 // insert this segment into out of order buffer
                 if (hdr->th_seq >= ctx->th_remote)
                     insert(&r_buf, hdr, data);
-                /* printf("SEGMENT RCVD: seq: %d remote: %d size: %lu\n", */
-                /*        hdr->th_seq, ctx->th_remote, strlen(data)); */
+                printf("SEGMENT RCVD: seq: %d remote: %d size: %lu\n",
+                       hdr->th_seq, ctx->th_remote, strlen(data));
                 
                 // received FIN
                 if (hdr->th_flags == TH_FIN) {
-                    /* printf("FIN\n"); */
+                    printf("FIN\n");
                     if (!ctx->l_fin) {
+                        printf("HERE\n");
                         mysock_context_t *ctx_s = _mysock_get_context(sd);
                         ctx_s->close_requested = true;
                     }
@@ -311,18 +313,23 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                     transmitted += strlen(data);
                     print_progress(transmitted);
 
-                    stcp_app_send(sd, data, strlen(data));
+                    /* stcp_app_send(sd, data, strlen(data)); */
+                    stcp_app_send(sd, data, rcvd);
                     // obtain the proper ACK (if there are more packets that
                     // were received out of order
+                    /* int newack = topinorder(sd, &r_buf, */
+                    /*                         hdr->th_seq+strlen(data)) + 1; */
+                    /* newack = newack == -1 ? */
+                    /*     hdr->th_seq+strlen(data)+1 : newack; */
                     int newack = topinorder(sd, &r_buf,
-                                            hdr->th_seq+strlen(data)) + 1;
+                                            hdr->th_seq+rcvd)+1;
                     newack = newack == -1 ?
-                        hdr->th_seq+strlen(data)+1 : newack;
+                        hdr->th_seq+rcvd+1 : newack;
 
 
                     ctx->th_remote = newack;
                     hdr->th_ack = ctx->th_remote;
-                    stcp_network_send(sd, hdr, HEADER_SIZE, NULL);
+                    stcp_network_send(sd,hdr, HEADER_SIZE, NULL);
                     // check to see if both parties are finished
                     if (ctx->l_fin && ctx->r_fin) ctx->done = true;
                 }
@@ -333,8 +340,8 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                     hdr->th_ack = ctx->th_remote;
                     stcp_network_send(sd, hdr, HEADER_SIZE, NULL);
                 }
-                /* printf("*********ACK SENT: seq: %d ack: %d***********\n", */
-                /*        hdr->th_seq, hdr->th_ack); */
+                printf("*********ACK SENT: seq: %d ack: %d***********\n",
+                       hdr->th_seq, hdr->th_ack);
             }
             clear_hdr(hdr);
         } // if (NETWORK_DATA)
@@ -351,16 +358,20 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
                 hdr->th_seq = ctx->th_local;
                 hdr->th_win = WINDOW_SIZE;
 
-                /* printf("*********APP SEND************\n"); */
-                /* printf("hdr->seq: %d ctx->local: %d size: %lu\n", */
-                /*        hdr->th_seq,ctx->th_local, strlen(data)); */
+                printf("*********APP SEND************\n");
+                printf("hdr->seq: %d ctx->local: %d size: %lu\n",
+                       hdr->th_seq,ctx->th_local, strlen(data));
                 
-                stcp_network_send(sd, hdr, HEADER_SIZE, data,
-                                  strlen(data), NULL);
+                /* size_t sent = stcp_network_send(sd, hdr, HEADER_SIZE, data, */
+                /*                                 strlen(data), NULL); */
+                size_t sent = stcp_network_send(sd, hdr, HEADER_SIZE, data,
+                                                PACKET_SIZE-HEADER_SIZE, NULL);
+                printf("sent: %lu\n", sent);
 
                 // place this packet in the sender buffer
                 enqueue(&s_queue, hdr, data);
-                ctx->th_local += strlen(data)+1;
+                /* ctx->th_local += strlen(data)+1; */
+                ctx->th_local += sent+1;
 
                 clear_hdr(hdr);
             }
@@ -368,7 +379,7 @@ static void control_loop(mysocket_t sd, context_t *ctx) {
 
         // APP_CLOSE
         if (event & APP_CLOSE_REQUESTED) {
-            /* printf("APP CLOSE\n"); */
+            printf("APP CLOSE\n");
             hdr->th_flags = TH_FIN; hdr->th_seq = ctx->th_local;
             ctx->l_fin = true;
             char x[] = "";
@@ -394,17 +405,22 @@ void init_ooorder(ooorder *r_buf) {
 
 // insert a segment into the receiver out of order buffer
 void insert(ooorder *r_buf, tcphdr *hdr, const char *data) {
+    printf("INSERTING\n");
     // get size of data and read into header and payload
-    ssize_t len = strlen(data)+HEADER_SIZE+1;
-    char *packet = (char *) calloc(1, len);
+    /* ssize_t len = strlen(data)+HEADER_SIZE+1; */
+    /* char *packet = (char *) calloc(1, len); */
+    char *packet = (char *) calloc(1, PACKET_SIZE);
     memcpy(packet, hdr, sizeof(tcphdr));
-    memcpy(&packet[HEADER_SIZE], data, len-HEADER_SIZE);
+    /* memcpy(&packet[HEADER_SIZE], data, len-HEADER_SIZE); */
+    memcpy(&packet[HEADER_SIZE], data, PACKET_SIZE-HEADER_SIZE);
 
     // construct packet to be stored
     packet_t *pack = (packet_t *) calloc(1, sizeof(packet_t));
     pack->seq = hdr->th_seq;
-    pack->payload = (char *) malloc(len);
-    memcpy(pack->payload, packet, len);
+    /* pack->payload = (char *) malloc(len); */
+    /* memcpy(pack->payload, packet, len); */
+    pack->payload = (char *) malloc(PACKET_SIZE-HEADER_SIZE);
+    memcpy(pack->payload, packet, PACKET_SIZE-HEADER_SIZE);
 
     // empty list
     if (r_buf->head == NULL) {
